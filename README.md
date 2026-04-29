@@ -12,6 +12,58 @@ they already have.
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
 - `/codex:rescue`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work and manage background jobs
+- **Image generation (this fork):** `/codex:image`, `/codex:image-enqueue`, `/codex:image-status`, `/codex:image-result`
+
+## Image generation (`/codex:image`)
+
+This fork adds a thin wrapper around Codex's built-in `image_generation` tool
+(gpt-image-2). It is hard-serialized behind a global lock at
+`~/.codex/.image-gen.lock` because the ChatGPT `/codex/responses` streaming
+endpoint disconnects under concurrent same-account sessions, which causes
+Codex to hallucinate success and grab another session's image. The wrapper:
+
+- Anchors retrieval on the Codex thread id, so it always picks up the right
+  PNG from `~/.codex/generated_images/{thread-id}/`.
+- Validates output ≥ 50 KB (rejects placeholder / hallucinated success).
+- Appends every attempt to `~/.codex/image-gen-log.jsonl` with `duration_ms`,
+  `size_bytes`, `error_class` (`quota` / `network` / `no_image` / `auth` /
+  `invalid_input` / `sandbox` / `unknown`) for after-the-fact analysis.
+
+### Synchronous one-shot
+
+```bash
+/codex:image --size 1024x1024 --output ./hero.png \
+  "A young French sailor in 1815 wedding attire, candlelit Marseille tavern, photorealistic"
+```
+
+Sizes: `auto`, `1024x1024`, `1024x1536`, `1536x1024`, or any `WxH` with both
+sides multiples of 16 between 16 and 3840. A single 1024² takes ~2.5–3
+minutes end-to-end on a ChatGPT subscription path.
+
+### Persistent queue
+
+For batches you don't want to babysit, use the queue. The first enqueue
+spawns a detached worker daemon that drains the FIFO serially and exits
+after 30 seconds of idle. Survives terminal close.
+
+```bash
+/codex:image-enqueue --output ./shot01.png "..."   # returns a job id
+/codex:image-enqueue --output ./shot02.png "..."   # queues behind shot01
+/codex:image-status                                # lock + worker + queue snapshot
+/codex:image-result img_abc_123                    # final state for one job
+```
+
+Useful flags shared by `image` and `image-enqueue`:
+
+- `--size` — output dimensions (see above)
+- `--output` — destination PNG path (must end in `.png`)
+- `--effort` — Codex reasoning effort (`none|minimal|low|medium|high|xhigh`).
+  Defaults to Codex's server default; `minimal` may cause the model to skip
+  the tool call entirely.
+- `--prompt-file` — read the prompt from a file
+- `--model` — override the Codex model
+- `--cwd` — run the underlying Codex thread in this working directory
+- `--json` — machine-readable output
 
 ## Requirements
 
