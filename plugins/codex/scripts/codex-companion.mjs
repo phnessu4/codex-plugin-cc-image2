@@ -2,6 +2,7 @@
 
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -70,6 +71,22 @@ const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "hi
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
+const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+const IMAGE_GEN_DIR = path.join(CODEX_HOME, "generated_images");
+const IMAGE_GEN_LOCK = path.join(CODEX_HOME, ".image-gen.lock");
+const IMAGE_GEN_LOG = path.join(CODEX_HOME, "image-gen-log.jsonl");
+const IMAGE_JOBS_DIR = path.join(CODEX_HOME, "image-jobs");
+const IMAGE_WORKER_PID_FILE = path.join(IMAGE_JOBS_DIR, "worker.pid");
+const NAMED_IMAGE_SIZES = new Set(["1024x1024", "1024x1536", "1536x1024", "auto"]);
+const MIN_VALID_IMAGE_BYTES = 50_000;
+const IMAGE_LOCK_STALE_MS = 10 * 60 * 1000;
+const IMAGE_LOCK_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
+const IMAGE_LOCK_POLL_INTERVAL_MS = 1000;
+const IMAGE_PROMPT_PREVIEW_LIMIT = 200;
+const IMAGE_WORKER_STALE_MS = 5 * 60 * 1000;
+const IMAGE_WORKER_IDLE_EXIT_MS = 30 * 1000;
+const IMAGE_WORKER_TICK_MS = 1000;
+
 function printUsage() {
   console.log(
     [
@@ -78,6 +95,10 @@ function printUsage() {
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs image [--size <WxH>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt]",
+      "  node scripts/codex-companion.mjs image-enqueue [--size <WxH>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt]",
+      "  node scripts/codex-companion.mjs image-status [--json]",
+      "  node scripts/codex-companion.mjs image-result <job-id> [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
@@ -837,6 +858,784 @@ async function handleTaskWorker(argv) {
   );
 }
 
+function previewPrompt(text) {
+  const flat = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (flat.length <= IMAGE_PROMPT_PREVIEW_LIMIT) {
+    return flat;
+  }
+  return `${flat.slice(0, IMAGE_PROMPT_PREVIEW_LIMIT - 3)}...`;
+}
+
+function classifyImageGenError({ message, stderr }) {
+  const haystack = `${message ?? ""}\n${stderr ?? ""}`.toLowerCase();
+  if (/rate.?limit|quota|429|too many requests|usage cap|usage limit|exceed/.test(haystack)) {
+    return "quota";
+  }
+  if (/auth|login|credential|unauthori[sz]ed|401|forbidden|403/.test(haystack)) {
+    return "auth";
+  }
+  if (/reconnect|stream|timeout|network|econn|enetunreach|etimedout/.test(haystack)) {
+    return "network";
+  }
+  if (/no png|did not produce|placeholder|hallucinat/.test(haystack)) {
+    return "no_image";
+  }
+  if (/invalid|must end|out of range|multiples of/.test(haystack)) {
+    return "invalid_input";
+  }
+  if (/sandbox/.test(haystack)) {
+    return "sandbox";
+  }
+  return "unknown";
+}
+
+function appendImageGenLog(entry) {
+  try {
+    fs.mkdirSync(CODEX_HOME, { recursive: true });
+    fs.appendFileSync(IMAGE_GEN_LOG, `${JSON.stringify(entry)}\n`);
+  } catch (_err) {
+    // logging must never throw
+  }
+}
+
+function isValidImageSize(size) {
+  if (NAMED_IMAGE_SIZES.has(size)) {
+    return true;
+  }
+  const match = /^(\d+)x(\d+)$/.exec(size);
+  if (!match) {
+    return false;
+  }
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  if (!Number.isInteger(width) || !Number.isInteger(height)) {
+    return false;
+  }
+  if (width <= 0 || height <= 0 || width > 3840 || height > 3840) {
+    return false;
+  }
+  if (width % 16 !== 0 || height % 16 !== 0) {
+    return false;
+  }
+  return true;
+}
+
+function buildImageTurnPrompt({ promptText, size, outputPath }) {
+  const sanitized = String(promptText).replace(/\s+/g, " ").trim();
+  return [
+    "Use your built-in image_generation tool (gpt-image-2) to generate exactly one image.",
+    `Image size: ${size}.`,
+    `Save the resulting PNG as ${outputPath}.`,
+    "Do not perform any other action: do not list directories, run searches, copy files manually, or write code.",
+    "After generation, reply with only the absolute file path on a single line — no other text.",
+    "",
+    "Image prompt:",
+    sanitized
+  ].join("\n");
+}
+
+function findLatestSessionImage(sessionId) {
+  if (!sessionId) {
+    return null;
+  }
+  const sessionDir = path.join(IMAGE_GEN_DIR, sessionId);
+  let entries;
+  try {
+    entries = fs.readdirSync(sessionDir);
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      return null;
+    }
+    throw err;
+  }
+  const pngs = entries
+    .filter((name) => name.toLowerCase().endsWith(".png"))
+    .map((name) => {
+      const fullPath = path.join(sessionDir, name);
+      const stat = fs.statSync(fullPath);
+      return { fullPath, mtimeMs: stat.mtimeMs };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return pngs.length > 0 ? pngs[0].fullPath : null;
+}
+
+function readImageGenLockHolder() {
+  let raw;
+  try {
+    raw = fs.readFileSync(IMAGE_GEN_LOCK, "utf8");
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      return null;
+    }
+    throw err;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return {
+      pid: typeof parsed.pid === "number" ? parsed.pid : null,
+      acquiredAt: typeof parsed.acquiredAt === "string" ? parsed.acquiredAt : null
+    };
+  } catch (_err) {
+    return { pid: null, acquiredAt: null };
+  }
+}
+
+function readImageGenLockState({ staleMs = IMAGE_LOCK_STALE_MS } = {}) {
+  let stat;
+  try {
+    stat = fs.statSync(IMAGE_GEN_LOCK);
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      return { state: "idle", lockPath: IMAGE_GEN_LOCK };
+    }
+    throw err;
+  }
+  const holder = readImageGenLockHolder();
+  const ageMs = Date.now() - stat.mtimeMs;
+  return {
+    state: ageMs > staleMs ? "stale" : "busy",
+    lockPath: IMAGE_GEN_LOCK,
+    holder,
+    ageMs,
+    staleThresholdMs: staleMs
+  };
+}
+
+async function acquireImageGenLock({
+  pollIntervalMs = IMAGE_LOCK_POLL_INTERVAL_MS,
+  timeoutMs = IMAGE_LOCK_WAIT_TIMEOUT_MS,
+  staleMs = IMAGE_LOCK_STALE_MS,
+  onWait = null
+} = {}) {
+  fs.mkdirSync(CODEX_HOME, { recursive: true });
+  const start = Date.now();
+  let waitNotified = false;
+  while (true) {
+    let fd;
+    try {
+      fd = fs.openSync(IMAGE_GEN_LOCK, "wx");
+    } catch (err) {
+      if (err.code !== "EEXIST") {
+        throw err;
+      }
+      let mtimeMs = 0;
+      try {
+        mtimeMs = fs.statSync(IMAGE_GEN_LOCK).mtimeMs;
+      } catch (statErr) {
+        if (statErr.code === "ENOENT") {
+          continue;
+        }
+        throw statErr;
+      }
+      if (Date.now() - mtimeMs > staleMs) {
+        try {
+          fs.unlinkSync(IMAGE_GEN_LOCK);
+        } catch (unlinkErr) {
+          if (unlinkErr.code !== "ENOENT") {
+            throw unlinkErr;
+          }
+        }
+        continue;
+      }
+      if (!waitNotified && typeof onWait === "function") {
+        waitNotified = true;
+        try {
+          onWait({ holder: readImageGenLockHolder(), ageMs: Date.now() - mtimeMs });
+        } catch (_err) {
+          // ignore notification failures
+        }
+      }
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(
+          `Image generation lock at ${IMAGE_GEN_LOCK} held for >${Math.round(timeoutMs / 1000)}s. Aborting.`
+        );
+      }
+      await sleep(pollIntervalMs);
+      continue;
+    }
+
+    fs.writeSync(
+      fd,
+      JSON.stringify({ pid: process.pid, acquiredAt: nowIso() })
+    );
+    fs.closeSync(fd);
+    return {
+      release: () => {
+        try {
+          fs.unlinkSync(IMAGE_GEN_LOCK);
+        } catch (err) {
+          if (err.code !== "ENOENT") {
+            throw err;
+          }
+        }
+      }
+    };
+  }
+}
+
+function resolveImageGenRequest({ promptText, size, outputArg, cwd, model, effort }) {
+  if (!promptText || !String(promptText).trim()) {
+    throw new Error("Provide a prompt, a --prompt-file, or piped stdin describing the image.");
+  }
+  const requestedSize = size ?? "1024x1024";
+  if (!isValidImageSize(requestedSize)) {
+    throw new Error(
+      `Invalid --size "${requestedSize}". Use "auto" or a WxH value where both sides are multiples of 16, between 16 and 3840.`
+    );
+  }
+  const defaultName = `codex_image_${Date.now()}.png`;
+  const outputPath = path.resolve(cwd, outputArg ?? `./${defaultName}`);
+  if (!outputPath.toLowerCase().endsWith(".png")) {
+    throw new Error(`--output must end with .png; got "${outputPath}".`);
+  }
+  return {
+    cwd,
+    promptText: String(promptText),
+    size: requestedSize,
+    outputPath,
+    model: normalizeRequestedModel(model),
+    effort: normalizeReasoningEffort(effort)
+  };
+}
+
+async function executeImageGen(request, { onLockWait } = {}) {
+  fs.mkdirSync(path.dirname(request.outputPath), { recursive: true });
+  ensureCodexAvailable(request.cwd);
+
+  const startedAt = Date.now();
+  const startedAtIso = nowIso();
+  const promptPreview = previewPrompt(request.promptText);
+  const baseLogEntry = {
+    ts: startedAtIso,
+    cwd: request.cwd,
+    output_path: request.outputPath,
+    requested_size: request.size,
+    model: request.model,
+    effort: request.effort,
+    prompt_preview: promptPreview,
+    prompt_length: request.promptText.length
+  };
+
+  const lock = await acquireImageGenLock({
+    onWait: (info) => {
+      const heldBy = info.holder?.pid ? ` by pid ${info.holder.pid}` : "";
+      const since = info.holder?.acquiredAt ? ` since ${info.holder.acquiredAt}` : "";
+      const message = `[codex:image] waiting for ~/.codex/.image-gen.lock (held${heldBy}${since}) — image generations are serialized to avoid ChatGPT stream breaks.\n`;
+      if (typeof onLockWait === "function") {
+        try {
+          onLockWait({ ...info, message });
+        } catch (_err) {
+          // ignore notifier failures
+        }
+      } else {
+        process.stderr.write(message);
+      }
+    }
+  });
+
+  let result;
+  try {
+    try {
+      result = await runAppServerTurn(request.cwd, {
+        prompt: buildImageTurnPrompt({
+          promptText: request.promptText,
+          size: request.size,
+          outputPath: request.outputPath
+        }),
+        defaultPrompt: "",
+        model: request.model,
+        effort: request.effort,
+        sandbox: "workspace-write",
+        persistThread: false,
+        threadName: null
+      });
+    } catch (err) {
+      const errorClass = classifyImageGenError({ message: err?.message, stderr: "" });
+      appendImageGenLog({
+        ...baseLogEntry,
+        finished_at: nowIso(),
+        duration_ms: Date.now() - startedAt,
+        status: "error",
+        error_class: errorClass,
+        error_message: String(err?.message ?? err)
+      });
+      throw err;
+    }
+  } finally {
+    lock.release();
+  }
+
+  const sessionId = result?.threadId ?? null;
+  let resolvedImage = null;
+
+  if (fs.existsSync(request.outputPath)) {
+    const sz = fs.statSync(request.outputPath).size;
+    if (sz >= MIN_VALID_IMAGE_BYTES) {
+      resolvedImage = request.outputPath;
+    }
+  }
+
+  if (!resolvedImage) {
+    const sessionImage = findLatestSessionImage(sessionId);
+    if (sessionImage) {
+      fs.copyFileSync(sessionImage, request.outputPath);
+      resolvedImage = request.outputPath;
+    }
+  }
+
+  if (!resolvedImage) {
+    const detail = sessionId
+      ? `Checked ${request.outputPath} and ${path.join(IMAGE_GEN_DIR, sessionId)} — neither contained a PNG.`
+      : `Checked ${request.outputPath}; no Codex thread id was captured so the session directory could not be inspected.`;
+    const stderrSnippet = result?.stderr ? `\nCodex stderr: ${String(result.stderr).trim()}` : "";
+    const message = `Image generation produced no PNG. ${detail}${stderrSnippet}`;
+    const errorClass = classifyImageGenError({
+      message,
+      stderr: result?.stderr ?? ""
+    });
+    appendImageGenLog({
+      ...baseLogEntry,
+      finished_at: nowIso(),
+      duration_ms: Date.now() - startedAt,
+      thread_id: sessionId,
+      status: "error",
+      error_class: errorClass,
+      error_message: message,
+      codex_status: result?.status ?? null,
+      codex_final_message: previewPrompt(result?.finalMessage ?? "")
+    });
+    throw new Error(message);
+  }
+
+  const stats = fs.statSync(resolvedImage);
+  if (stats.size < MIN_VALID_IMAGE_BYTES) {
+    const message = `Output image is suspiciously small (${stats.size} bytes); likely a placeholder or hallucinated success. Path: ${resolvedImage}`;
+    appendImageGenLog({
+      ...baseLogEntry,
+      finished_at: nowIso(),
+      duration_ms: Date.now() - startedAt,
+      thread_id: sessionId,
+      status: "error",
+      error_class: "no_image",
+      error_message: message,
+      size_bytes: stats.size
+    });
+    throw new Error(message);
+  }
+
+  const payload = {
+    status: "ok",
+    outputPath: resolvedImage,
+    sizeBytes: stats.size,
+    requestedSize: request.size,
+    threadId: sessionId,
+    sessionImageDir: sessionId ? path.join(IMAGE_GEN_DIR, sessionId) : null
+  };
+
+  appendImageGenLog({
+    ...baseLogEntry,
+    finished_at: nowIso(),
+    duration_ms: Date.now() - startedAt,
+    thread_id: sessionId,
+    status: "ok",
+    size_bytes: stats.size
+  });
+
+  return payload;
+}
+
+async function handleImage(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["model", "effort", "size", "output", "prompt-file", "cwd"],
+    booleanOptions: ["json"],
+    aliasMap: {
+      m: "model",
+      s: "size",
+      o: "output"
+    }
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const promptText = readTaskPrompt(cwd, options, positionals);
+  const request = resolveImageGenRequest({
+    promptText,
+    size: options.size,
+    outputArg: options.output,
+    cwd,
+    model: options.model,
+    effort: options.effort
+  });
+  const payload = await executeImageGen(request);
+  outputCommandResult(payload, `${payload.outputPath}\n`, options.json);
+}
+
+function generateImageJobId() {
+  const stamp = Date.now().toString(36);
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `img_${stamp}_${rand}`;
+}
+
+function imageJobPath(jobId) {
+  return path.join(IMAGE_JOBS_DIR, `${jobId}.json`);
+}
+
+function readImageJob(jobId) {
+  let raw;
+  try {
+    raw = fs.readFileSync(imageJobPath(jobId), "utf8");
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      return null;
+    }
+    throw err;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (_err) {
+    return null;
+  }
+}
+
+function writeImageJob(record) {
+  fs.mkdirSync(IMAGE_JOBS_DIR, { recursive: true });
+  const tmp = `${imageJobPath(record.id)}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(record, null, 2));
+  fs.renameSync(tmp, imageJobPath(record.id));
+}
+
+function listImageJobs(filter = () => true) {
+  let entries;
+  try {
+    entries = fs.readdirSync(IMAGE_JOBS_DIR);
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      return [];
+    }
+    throw err;
+  }
+  const jobs = [];
+  for (const name of entries) {
+    if (!name.endsWith(".json")) continue;
+    const id = name.slice(0, -".json".length);
+    const job = readImageJob(id);
+    if (job && filter(job)) {
+      jobs.push(job);
+    }
+  }
+  jobs.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+  return jobs;
+}
+
+function isPidAlive(pid) {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM";
+  }
+}
+
+function readImageWorkerPid() {
+  let raw;
+  try {
+    raw = fs.readFileSync(IMAGE_WORKER_PID_FILE, "utf8");
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      return null;
+    }
+    throw err;
+  }
+  const pid = Number.parseInt(String(raw).trim(), 10);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+function clearStaleImageWorkerPid() {
+  const pid = readImageWorkerPid();
+  if (pid === null) {
+    return;
+  }
+  if (!isPidAlive(pid)) {
+    try {
+      fs.unlinkSync(IMAGE_WORKER_PID_FILE);
+    } catch (err) {
+      if (err.code !== "ENOENT") {
+        throw err;
+      }
+    }
+  }
+}
+
+function spawnImageWorker() {
+  const scriptPath = fileURLToPath(import.meta.url);
+  const child = spawn(process.execPath, [scriptPath, "image-worker"], {
+    detached: true,
+    stdio: "ignore",
+    env: process.env,
+    windowsHide: true
+  });
+  child.unref();
+  return child;
+}
+
+function ensureImageWorkerRunning() {
+  fs.mkdirSync(IMAGE_JOBS_DIR, { recursive: true });
+  clearStaleImageWorkerPid();
+  const pid = readImageWorkerPid();
+  if (pid && isPidAlive(pid)) {
+    return { spawned: false, pid };
+  }
+  const child = spawnImageWorker();
+  return { spawned: true, pid: child.pid ?? null };
+}
+
+async function handleImageEnqueue(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["model", "effort", "size", "output", "prompt-file", "cwd"],
+    booleanOptions: ["json"],
+    aliasMap: {
+      m: "model",
+      s: "size",
+      o: "output"
+    }
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const promptText = readTaskPrompt(cwd, options, positionals);
+  const request = resolveImageGenRequest({
+    promptText,
+    size: options.size,
+    outputArg: options.output,
+    cwd,
+    model: options.model,
+    effort: options.effort
+  });
+
+  const jobId = generateImageJobId();
+  const createdAt = nowIso();
+  const record = {
+    id: jobId,
+    createdAt,
+    status: "pending",
+    request: {
+      cwd: request.cwd,
+      promptText: request.promptText,
+      size: request.size,
+      outputPath: request.outputPath,
+      model: request.model,
+      effort: request.effort
+    },
+    promptPreview: previewPrompt(request.promptText)
+  };
+  writeImageJob(record);
+
+  const worker = ensureImageWorkerRunning();
+  const pending = listImageJobs((job) => job.status === "pending").length;
+
+  const payload = {
+    status: "queued",
+    jobId,
+    createdAt,
+    promptPreview: record.promptPreview,
+    requestedSize: request.size,
+    outputPath: request.outputPath,
+    pendingCount: pending,
+    workerPid: worker.pid,
+    workerSpawned: worker.spawned
+  };
+  const rendered = `Enqueued ${jobId} (${pending} pending). Worker pid ${worker.pid ?? "unknown"}${
+    worker.spawned ? " (spawned)" : ""
+  }. Check /codex:image-status or /codex:image-result ${jobId}.\n`;
+  outputCommandResult(payload, rendered, options.json);
+}
+
+async function handleImageWorker() {
+  fs.mkdirSync(IMAGE_JOBS_DIR, { recursive: true });
+  // Acquire worker pid file atomically.
+  let pidHandle;
+  try {
+    pidHandle = fs.openSync(IMAGE_WORKER_PID_FILE, "wx");
+  } catch (err) {
+    if (err.code !== "EEXIST") {
+      throw err;
+    }
+    const existing = readImageWorkerPid();
+    if (existing && isPidAlive(existing)) {
+      // Another worker is already running.
+      return;
+    }
+    // Stale; remove and retry once.
+    try {
+      fs.unlinkSync(IMAGE_WORKER_PID_FILE);
+    } catch (rmErr) {
+      if (rmErr.code !== "ENOENT") {
+        throw rmErr;
+      }
+    }
+    pidHandle = fs.openSync(IMAGE_WORKER_PID_FILE, "wx");
+  }
+  fs.writeSync(pidHandle, String(process.pid));
+  fs.closeSync(pidHandle);
+
+  let idleSince = null;
+  try {
+    while (true) {
+      const pending = listImageJobs((job) => job.status === "pending");
+      if (pending.length === 0) {
+        if (idleSince === null) {
+          idleSince = Date.now();
+        } else if (Date.now() - idleSince > IMAGE_WORKER_IDLE_EXIT_MS) {
+          break;
+        }
+        await sleep(IMAGE_WORKER_TICK_MS);
+        continue;
+      }
+      idleSince = null;
+
+      const job = pending[0];
+      job.status = "processing";
+      job.startedAt = nowIso();
+      job.workerPid = process.pid;
+      writeImageJob(job);
+
+      try {
+        const payload = await executeImageGen(job.request, {
+          onLockWait: () => {
+            // worker is the lock holder; not expected to wait, but tolerate it
+          }
+        });
+        job.status = "done";
+        job.finishedAt = nowIso();
+        job.result = payload;
+        writeImageJob(job);
+      } catch (err) {
+        const errorMessage = String(err?.message ?? err);
+        const errorClass = classifyImageGenError({ message: errorMessage, stderr: "" });
+        job.status = "failed";
+        job.finishedAt = nowIso();
+        job.error = { class: errorClass, message: errorMessage };
+        writeImageJob(job);
+      }
+    }
+  } finally {
+    try {
+      const current = readImageWorkerPid();
+      if (current === process.pid) {
+        fs.unlinkSync(IMAGE_WORKER_PID_FILE);
+      }
+    } catch (err) {
+      if (err.code !== "ENOENT") {
+        // best effort
+      }
+    }
+  }
+}
+
+function handleImageResult(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    booleanOptions: ["json"]
+  });
+  const jobId = positionals[0];
+  if (!jobId) {
+    throw new Error("Provide a job id, e.g. `image-result img_abc_123`.");
+  }
+  const job = readImageJob(jobId);
+  if (!job) {
+    throw new Error(`No image job found for id "${jobId}".`);
+  }
+  let rendered;
+  if (job.status === "done") {
+    rendered = `Job ${job.id}: done. Image at ${job.result?.outputPath ?? "<unknown>"} (${job.result?.sizeBytes ?? "?"} bytes).\n`;
+  } else if (job.status === "failed") {
+    rendered = `Job ${job.id}: failed (${job.error?.class ?? "unknown"}). ${job.error?.message ?? ""}\n`;
+  } else {
+    rendered = `Job ${job.id}: ${job.status}. Created ${job.createdAt}, started ${job.startedAt ?? "—"}.\n`;
+  }
+  outputCommandResult(job, rendered, options.json);
+}
+
+function buildImageQueueSnapshot() {
+  clearStaleImageWorkerPid();
+  const jobs = listImageJobs(() => true);
+  const pending = jobs.filter((job) => job.status === "pending");
+  const processing = jobs.find((job) => job.status === "processing") ?? null;
+  const recent = jobs
+    .filter((job) => job.status === "done" || job.status === "failed")
+    .slice(-5);
+  const workerPid = readImageWorkerPid();
+  const workerAlive = workerPid !== null && isPidAlive(workerPid);
+  return {
+    workerPid,
+    workerAlive,
+    pendingCount: pending.length,
+    pendingJobIds: pending.map((job) => job.id),
+    processing: processing
+      ? {
+          id: processing.id,
+          startedAt: processing.startedAt,
+          promptPreview: processing.promptPreview
+        }
+      : null,
+    recentResults: recent.map((job) => ({
+      id: job.id,
+      status: job.status,
+      finishedAt: job.finishedAt,
+      errorClass: job.error?.class ?? null
+    }))
+  };
+}
+
+function handleImageStatus(argv) {
+  const { options } = parseCommandInput(argv, {
+    booleanOptions: ["json"]
+  });
+  const lockSnapshot = readImageGenLockState();
+  const queueSnapshot = buildImageQueueSnapshot();
+
+  const lines = [];
+  if (lockSnapshot.state === "idle") {
+    lines.push(`Lock: idle (${lockSnapshot.lockPath} absent)`);
+  } else if (lockSnapshot.state === "stale") {
+    const ageSeconds = Math.round((lockSnapshot.ageMs ?? 0) / 1000);
+    lines.push(
+      `Lock: stale (age ${ageSeconds}s > ${Math.round(lockSnapshot.staleThresholdMs / 1000)}s threshold; will be reclaimed)`
+    );
+  } else {
+    const ageSeconds = Math.round((lockSnapshot.ageMs ?? 0) / 1000);
+    const heldBy = lockSnapshot.holder?.pid ? ` pid ${lockSnapshot.holder.pid}` : "";
+    const since = lockSnapshot.holder?.acquiredAt ? ` since ${lockSnapshot.holder.acquiredAt}` : "";
+    lines.push(`Lock: busy${heldBy}${since} (age ${ageSeconds}s)`);
+  }
+  if (queueSnapshot.workerPid !== null) {
+    lines.push(
+      `Worker: pid ${queueSnapshot.workerPid} ${queueSnapshot.workerAlive ? "alive" : "stale (will be respawned on next enqueue)"}`
+    );
+  } else {
+    lines.push("Worker: not running");
+  }
+  lines.push(`Pending jobs: ${queueSnapshot.pendingCount}`);
+  if (queueSnapshot.processing) {
+    lines.push(
+      `Processing: ${queueSnapshot.processing.id} (started ${queueSnapshot.processing.startedAt ?? "?"})`
+    );
+  }
+  if (queueSnapshot.recentResults.length > 0) {
+    lines.push("Recent:");
+    for (const entry of queueSnapshot.recentResults) {
+      const tag = entry.status === "done" ? "ok" : `failed (${entry.errorClass ?? "unknown"})`;
+      lines.push(`  - ${entry.id} ${tag} @ ${entry.finishedAt ?? "?"}`);
+    }
+  }
+
+  const payload = {
+    lock: lockSnapshot,
+    queue: queueSnapshot
+  };
+  outputCommandResult(payload, `${lines.join("\n")}\n`, options.json);
+}
+
 async function handleStatus(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
@@ -1002,6 +1801,21 @@ async function main() {
       break;
     case "task-worker":
       await handleTaskWorker(argv);
+      break;
+    case "image":
+      await handleImage(argv);
+      break;
+    case "image-enqueue":
+      await handleImageEnqueue(argv);
+      break;
+    case "image-worker":
+      await handleImageWorker();
+      break;
+    case "image-result":
+      handleImageResult(argv);
+      break;
+    case "image-status":
+      handleImageStatus(argv);
       break;
     case "status":
       await handleStatus(argv);
