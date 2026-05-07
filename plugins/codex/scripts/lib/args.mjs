@@ -1,10 +1,19 @@
 export function parseArgs(argv, config = {}) {
   const valueOptions = new Set(config.valueOptions ?? []);
   const booleanOptions = new Set(config.booleanOptions ?? []);
+  const arrayOptions = new Set(config.arrayOptions ?? []);
   const aliasMap = config.aliasMap ?? {};
   const options = {};
   const positionals = [];
   let passthrough = false;
+
+  function pushArrayValue(key, raw) {
+    if (!options[key]) options[key] = [];
+    for (const part of String(raw).split(",")) {
+      const trimmed = part.trim();
+      if (trimmed) options[key].push(trimmed);
+    }
+  }
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
@@ -33,6 +42,18 @@ export function parseArgs(argv, config = {}) {
         continue;
       }
 
+      if (arrayOptions.has(key)) {
+        const nextValue = inlineValue ?? argv[index + 1];
+        if (nextValue === undefined) {
+          throw new Error(`Missing value for --${rawKey}`);
+        }
+        pushArrayValue(key, nextValue);
+        if (inlineValue === undefined) {
+          index += 1;
+        }
+        continue;
+      }
+
       if (valueOptions.has(key)) {
         const nextValue = inlineValue ?? argv[index + 1];
         if (nextValue === undefined) {
@@ -54,6 +75,16 @@ export function parseArgs(argv, config = {}) {
 
     if (booleanOptions.has(key)) {
       options[key] = true;
+      continue;
+    }
+
+    if (arrayOptions.has(key)) {
+      const nextValue = argv[index + 1];
+      if (nextValue === undefined) {
+        throw new Error(`Missing value for -${shortKey}`);
+      }
+      pushArrayValue(key, nextValue);
+      index += 1;
       continue;
     }
 

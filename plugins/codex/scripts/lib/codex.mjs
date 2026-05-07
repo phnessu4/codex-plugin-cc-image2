@@ -77,8 +77,15 @@ function buildResumeParams(threadId, cwd, options = {}) {
 }
 
 /** @returns {UserInput[]} */
-function buildTurnInput(prompt) {
-  return [{ type: "text", text: prompt, text_elements: [] }];
+function buildTurnInput(prompt, refs = []) {
+  const items = [];
+  for (const ref of refs ?? []) {
+    if (typeof ref === "string" && ref.length > 0) {
+      items.push({ type: "local_image", path: ref });
+    }
+  }
+  items.push({ type: "text", text: prompt, text_elements: [] });
+  return items;
 }
 
 function shorten(text, limit = 72) {
@@ -1004,7 +1011,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       () =>
         client.request("turn/start", {
           threadId,
-          input: buildTurnInput(prompt),
+          input: buildTurnInput(prompt, options.refs ?? []),
           model: options.model ?? null,
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null

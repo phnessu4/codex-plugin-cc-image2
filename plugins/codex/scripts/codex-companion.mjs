@@ -96,6 +96,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs image [--size <WxH>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt]",
+      "  node scripts/codex-companion.mjs image-ref --ref <path>[,<path>...] [--ref <path>]... [--size <WxH>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt]",
       "  node scripts/codex-companion.mjs image-enqueue [--size <WxH>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt]",
       "  node scripts/codex-companion.mjs image-status [--json]",
       "  node scripts/codex-companion.mjs image-result <job-id> [--json]",
@@ -920,18 +921,24 @@ function isValidImageSize(size) {
   return true;
 }
 
-function buildImageTurnPrompt({ promptText, size, outputPath }) {
+function buildImageTurnPrompt({ promptText, size, outputPath, hasRefs = false }) {
   const sanitized = String(promptText).replace(/\s+/g, " ").trim();
-  return [
+  const lines = [
     "Use your built-in image_generation tool (gpt-image-2) to generate exactly one image.",
     `Image size: ${size}.`,
     `Save the resulting PNG as ${outputPath}.`,
     "Do not perform any other action: do not list directories, run searches, copy files manually, or write code.",
     "After generation, reply with only the absolute file path on a single line — no other text.",
-    "",
-    "Image prompt:",
-    sanitized
-  ].join("\n");
+    ""
+  ];
+  if (hasRefs) {
+    lines.push(
+      "The attached image(s) are reference inputs. Use them as character/scene/prop anchors — preserve facial structure, costume detail, set staging, and prop appearance from the references. The text prompt below describes the new shot composition; the references provide visual identity.",
+      ""
+    );
+  }
+  lines.push("Image prompt:", sanitized);
+  return lines.join("\n");
 }
 
 function findLatestSessionImage(sessionId) {
@@ -1073,7 +1080,9 @@ async function acquireImageGenLock({
   }
 }
 
-function resolveImageGenRequest({ promptText, size, outputArg, cwd, model, effort }) {
+const VALID_REF_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
+
+function resolveImageGenRequest({ promptText, size, outputArg, cwd, model, effort, refs }) {
   if (!promptText || !String(promptText).trim()) {
     throw new Error("Provide a prompt, a --prompt-file, or piped stdin describing the image.");
   }
@@ -1088,13 +1097,24 @@ function resolveImageGenRequest({ promptText, size, outputArg, cwd, model, effor
   if (!outputPath.toLowerCase().endsWith(".png")) {
     throw new Error(`--output must end with .png; got "${outputPath}".`);
   }
+  const resolvedRefs = (refs ?? []).map((p) => path.resolve(cwd, p));
+  for (const refPath of resolvedRefs) {
+    if (!fs.existsSync(refPath)) {
+      throw new Error(`--ref file not found: ${refPath}`);
+    }
+    const ext = path.extname(refPath).toLowerCase();
+    if (!VALID_REF_EXTENSIONS.has(ext)) {
+      throw new Error(`--ref must be a PNG/JPG/WebP image; got "${refPath}"`);
+    }
+  }
   return {
     cwd,
     promptText: String(promptText),
     size: requestedSize,
     outputPath,
     model: normalizeRequestedModel(model),
-    effort: normalizeReasoningEffort(effort)
+    effort: normalizeReasoningEffort(effort),
+    refs: resolvedRefs
   };
 }
 
@@ -1140,14 +1160,16 @@ async function executeImageGen(request, { onLockWait } = {}) {
         prompt: buildImageTurnPrompt({
           promptText: request.promptText,
           size: request.size,
-          outputPath: request.outputPath
+          outputPath: request.outputPath,
+          hasRefs: (request.refs ?? []).length > 0
         }),
         defaultPrompt: "",
         model: request.model,
         effort: request.effort,
         sandbox: "workspace-write",
         persistThread: false,
-        threadName: null
+        threadName: null,
+        refs: request.refs ?? []
       });
     } catch (err) {
       const errorClass = classifyImageGenError({ message: err?.message, stderr: "" });
@@ -1264,6 +1286,41 @@ async function handleImage(argv) {
     cwd,
     model: options.model,
     effort: options.effort
+  });
+  const payload = await executeImageGen(request);
+  outputCommandResult(payload, `${payload.outputPath}\n`, options.json);
+}
+
+async function handleImageRef(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["model", "effort", "size", "output", "prompt-file", "cwd"],
+    arrayOptions: ["ref"],
+    booleanOptions: ["json"],
+    aliasMap: {
+      m: "model",
+      s: "size",
+      o: "output",
+      r: "ref"
+    }
+  });
+
+  const refs = options.ref ?? [];
+  if (refs.length === 0) {
+    throw new Error(
+      "/codex:image-ref requires at least one --ref <path> (image-to-image / reference). For text-only generation use /codex:image."
+    );
+  }
+
+  const cwd = resolveCommandCwd(options);
+  const promptText = readTaskPrompt(cwd, options, positionals);
+  const request = resolveImageGenRequest({
+    promptText,
+    size: options.size,
+    outputArg: options.output,
+    cwd,
+    model: options.model,
+    effort: options.effort,
+    refs
   });
   const payload = await executeImageGen(request);
   outputCommandResult(payload, `${payload.outputPath}\n`, options.json);
@@ -1804,6 +1861,9 @@ async function main() {
       break;
     case "image":
       await handleImage(argv);
+      break;
+    case "image-ref":
+      await handleImageRef(argv);
       break;
     case "image-enqueue":
       await handleImageEnqueue(argv);
