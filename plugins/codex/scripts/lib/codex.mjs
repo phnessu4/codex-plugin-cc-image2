@@ -81,7 +81,7 @@ function buildTurnInput(prompt, refs = []) {
   const items = [];
   for (const ref of refs ?? []) {
     if (typeof ref === "string" && ref.length > 0) {
-      items.push({ type: "local_image", path: ref });
+      items.push({ type: "localImage", path: ref });
     }
   }
   items.push({ type: "text", text: prompt, text_elements: [] });
