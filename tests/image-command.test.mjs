@@ -42,16 +42,22 @@ test("image subcommand rejects sizes that are not multiples of 16", () => {
   assert.match(result.stderr, /Invalid --size/);
 });
 
-test("image subcommand rejects sizes outside the 16-3840 range", () => {
-  const tooBig = run("node", [SCRIPT, "image", "--size", "4096x1024", "--output", "/tmp/should-not-exist.png", "anything"], {
-    cwd: ROOT
-  });
-  assert.notEqual(tooBig.status, 0);
-  assert.match(tooBig.stderr, /Invalid --size/);
+test("image subcommand rejects custom WxH sizes outside the named set", () => {
+  // Custom WxH (even when 16-aligned and within 16-3840) is no longer accepted —
+  // backend may silently ignore custom dims (e.g. 1024x1024 returning ~1254x1254
+  // observed in practice). Restrict to the officially documented set.
+  for (const size of ["4096x1024", "768x1280", "2048x2048", "512x512"]) {
+    const result = run("node", [SCRIPT, "image", "--size", size, "--output", "/tmp/should-not-exist.png", "anything"], {
+      cwd: ROOT
+    });
+    assert.notEqual(result.status, 0, `Expected size "${size}" to be rejected`);
+    assert.match(result.stderr, /Invalid --size/);
+    assert.match(result.stderr, /1024x1024 \| 1024x1536 \| 1536x1024 \| auto/);
+  }
 });
 
-test("image subcommand accepts named sizes and 16-aligned WxH", () => {
-  for (const size of ["1024x1024", "1536x1024", "1024x1536", "auto", "768x1280"]) {
+test("image subcommand accepts only the four named sizes", () => {
+  for (const size of ["1024x1024", "1536x1024", "1024x1536", "auto"]) {
     const result = run("node", [SCRIPT, "image", "--size", size, "--output", "/tmp/should-not-exist.png", ""], {
       cwd: ROOT
     });
@@ -72,7 +78,7 @@ test("image subcommand rejects non-PNG output paths", () => {
 test("usage banner advertises the image subcommand", () => {
   const result = run("node", [SCRIPT, "help"], { cwd: ROOT });
   assert.equal(result.status, 0);
-  assert.match(result.stdout, /image \[--size <WxH>\]/);
+  assert.match(result.stdout, /image \[--size <1024x1024\|1024x1536\|1536x1024\|auto>\]/);
   assert.match(result.stdout, /\[--effort <none\|minimal\|low\|medium\|high\|xhigh>\]/);
   assert.match(result.stdout, /image-status \[--json\]/);
 });

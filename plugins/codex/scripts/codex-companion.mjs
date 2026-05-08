@@ -77,6 +77,12 @@ const IMAGE_GEN_LOCK = path.join(CODEX_HOME, ".image-gen.lock");
 const IMAGE_GEN_LOG = path.join(CODEX_HOME, "image-gen-log.jsonl");
 const IMAGE_JOBS_DIR = path.join(CODEX_HOME, "image-jobs");
 const IMAGE_WORKER_PID_FILE = path.join(IMAGE_JOBS_DIR, "worker.pid");
+// Per OpenAI image generation guide (gpt-image-1 / gpt-image-2): only these sizes are
+// officially supported. Custom WxH are technically accepted by the API but in practice
+// the backend may ignore the request — e.g. requesting 1024x1024 has been observed to
+// return ~1254x1254 (same ~1.57M total pixels as the non-square sizes). Restricting to
+// this set avoids silent surprises; downstream code can rely on requested ≈ actual for
+// 1024x1536 and 1536x1024 (1024x1024 still upsizes — see _Workflow/IMAGE_GEN_SOP.md §6).
 const NAMED_IMAGE_SIZES = new Set(["1024x1024", "1024x1536", "1536x1024", "auto"]);
 const MIN_VALID_IMAGE_BYTES = 50_000;
 const IMAGE_LOCK_STALE_MS = 10 * 60 * 1000;
@@ -95,9 +101,9 @@ function printUsage() {
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
-      "  node scripts/codex-companion.mjs image [--size <WxH>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt]",
-      "  node scripts/codex-companion.mjs image-ref --ref <path>[,<path>...] [--ref <path>]... [--size <WxH>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt]",
-      "  node scripts/codex-companion.mjs image-enqueue [--size <WxH>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt]",
+      "  node scripts/codex-companion.mjs image [--size <1024x1024|1024x1536|1536x1024|auto>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt]",
+      "  node scripts/codex-companion.mjs image-ref --ref <path>[,<path>...] [--ref <path>]... [--size <1024x1024|1024x1536|1536x1024|auto>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt]",
+      "  node scripts/codex-companion.mjs image-enqueue [--size <1024x1024|1024x1536|1536x1024|auto>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt]",
       "  node scripts/codex-companion.mjs image-status [--json]",
       "  node scripts/codex-companion.mjs image-result <job-id> [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
@@ -900,25 +906,7 @@ function appendImageGenLog(entry) {
 }
 
 function isValidImageSize(size) {
-  if (NAMED_IMAGE_SIZES.has(size)) {
-    return true;
-  }
-  const match = /^(\d+)x(\d+)$/.exec(size);
-  if (!match) {
-    return false;
-  }
-  const width = Number(match[1]);
-  const height = Number(match[2]);
-  if (!Number.isInteger(width) || !Number.isInteger(height)) {
-    return false;
-  }
-  if (width <= 0 || height <= 0 || width > 3840 || height > 3840) {
-    return false;
-  }
-  if (width % 16 !== 0 || height % 16 !== 0) {
-    return false;
-  }
-  return true;
+  return NAMED_IMAGE_SIZES.has(size);
 }
 
 function buildImageTurnPrompt({ promptText, size, outputPath, hasRefs = false }) {
@@ -1089,7 +1077,7 @@ function resolveImageGenRequest({ promptText, size, outputArg, cwd, model, effor
   const requestedSize = size ?? "1024x1024";
   if (!isValidImageSize(requestedSize)) {
     throw new Error(
-      `Invalid --size "${requestedSize}". Use "auto" or a WxH value where both sides are multiples of 16, between 16 and 3840.`
+      `Invalid --size "${requestedSize}". Allowed values: 1024x1024 | 1024x1536 | 1536x1024 | auto.`
     );
   }
   const defaultName = `codex_image_${Date.now()}.png`;
