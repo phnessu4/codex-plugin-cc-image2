@@ -77,13 +77,29 @@ const IMAGE_GEN_LOCK = path.join(CODEX_HOME, ".image-gen.lock");
 const IMAGE_GEN_LOG = path.join(CODEX_HOME, "image-gen-log.jsonl");
 const IMAGE_JOBS_DIR = path.join(CODEX_HOME, "image-jobs");
 const IMAGE_WORKER_PID_FILE = path.join(IMAGE_JOBS_DIR, "worker.pid");
-// Per OpenAI image generation guide (gpt-image-1 / gpt-image-2): only these sizes are
-// officially supported. Custom WxH are technically accepted by the API but in practice
-// the backend may ignore the request — e.g. requesting 1024x1024 has been observed to
-// return ~1254x1254 (same ~1.57M total pixels as the non-square sizes). Restricting to
-// this set avoids silent surprises; downstream code can rely on requested ≈ actual for
-// 1024x1536 and 1536x1024 (1024x1024 still upsizes — see _Workflow/IMAGE_GEN_SOP.md §6).
-const NAMED_IMAGE_SIZES = new Set(["1024x1024", "1024x1536", "1536x1024", "auto"]);
+// Discrete sizes explicitly listed by OpenAI's image generation guide for gpt-image-2,
+// plus the documented "auto" sentinel. The API technically accepts any WxH that meets
+// the constraints (edge ≤ 3840, mult of 16, ratio ≤ 3:1, 655,360 ≤ total ≤ 8,294,400)
+// but in practice we have observed the backend silently reshape some sizes —
+// e.g. 1024x1024 returns ~1254x1254 (same ~1.57M total pixels as the non-square 1.5M
+// sizes). Restricting to the discrete listed set avoids accidentally hitting another
+// silent reshape; downstream that needs exact pixels should A/B verify before relying
+// on a given size. See _Workflow/IMAGE_GEN_SOP.md §6 for the 1024x1024 caveat.
+//
+// Sizes above 2560x1440 are flagged as experimental in the official guide.
+const NAMED_IMAGE_SIZES = new Set([
+  // standard tier
+  "1024x1024",  // 1.05M px · square · fastest per OpenAI guide
+  "1024x1536",  // 1.57M px · portrait · 2:3
+  "1536x1024",  // 1.57M px · landscape · 3:2
+  "2048x1152",  // 2.36M px · landscape · 16:9 (2K)
+  "2048x2048",  // 4.19M px · square (2K)
+  // experimental tier (> 2560x1440)
+  "2160x3840",  // 8.29M px · portrait · 9:16 (4K)
+  "3840x2160",  // 8.29M px · landscape · 16:9 (4K)
+  // sentinel
+  "auto"
+]);
 const MIN_VALID_IMAGE_BYTES = 50_000;
 const IMAGE_LOCK_STALE_MS = 10 * 60 * 1000;
 const IMAGE_LOCK_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
@@ -101,9 +117,9 @@ function printUsage() {
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
-      "  node scripts/codex-companion.mjs image [--size <1024x1024|1024x1536|1536x1024|auto>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt]",
-      "  node scripts/codex-companion.mjs image-ref --ref <path>[,<path>...] [--ref <path>]... [--size <1024x1024|1024x1536|1536x1024|auto>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt]",
-      "  node scripts/codex-companion.mjs image-enqueue [--size <1024x1024|1024x1536|1536x1024|auto>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt]",
+      "  node scripts/codex-companion.mjs image [--size <1024x1024|1024x1536|1536x1024|2048x1152|2048x2048|2160x3840|3840x2160|auto>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt]",
+      "  node scripts/codex-companion.mjs image-ref --ref <path>[,<path>...] [--ref <path>]... [--size <1024x1024|1024x1536|1536x1024|2048x1152|2048x2048|2160x3840|3840x2160|auto>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt]",
+      "  node scripts/codex-companion.mjs image-enqueue [--size <1024x1024|1024x1536|1536x1024|2048x1152|2048x2048|2160x3840|3840x2160|auto>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt]",
       "  node scripts/codex-companion.mjs image-status [--json]",
       "  node scripts/codex-companion.mjs image-result <job-id> [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
@@ -1077,7 +1093,7 @@ function resolveImageGenRequest({ promptText, size, outputArg, cwd, model, effor
   const requestedSize = size ?? "1024x1024";
   if (!isValidImageSize(requestedSize)) {
     throw new Error(
-      `Invalid --size "${requestedSize}". Allowed values: 1024x1024 | 1024x1536 | 1536x1024 | auto.`
+      `Invalid --size "${requestedSize}". Allowed values: 1024x1024 | 1024x1536 | 1536x1024 | 2048x1152 | 2048x2048 | 2160x3840 | 3840x2160 | auto. (Sizes above 2560x1440 are experimental per OpenAI guide.)`
     );
   }
   const defaultName = `codex_image_${Date.now()}.png`;

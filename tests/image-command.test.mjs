@@ -43,21 +43,29 @@ test("image subcommand rejects sizes that are not multiples of 16", () => {
 });
 
 test("image subcommand rejects custom WxH sizes outside the named set", () => {
-  // Custom WxH (even when 16-aligned and within 16-3840) is no longer accepted —
-  // backend may silently ignore custom dims (e.g. 1024x1024 returning ~1254x1254
-  // observed in practice). Restrict to the officially documented set.
-  for (const size of ["4096x1024", "768x1280", "2048x2048", "512x512"]) {
+  // Custom WxH (even when 16-aligned and within OpenAI's stated constraints) is not
+  // accepted because the backend has been observed to silently reshape some sizes
+  // (e.g. 1024x1024 returning ~1254x1254). Restrict to the discrete set listed in
+  // OpenAI's image generation guide for gpt-image-2.
+  for (const size of ["4096x1024", "768x1280", "1280x720", "512x512", "1920x1080"]) {
     const result = run("node", [SCRIPT, "image", "--size", size, "--output", "/tmp/should-not-exist.png", "anything"], {
       cwd: ROOT
     });
     assert.notEqual(result.status, 0, `Expected size "${size}" to be rejected`);
     assert.match(result.stderr, /Invalid --size/);
-    assert.match(result.stderr, /1024x1024 \| 1024x1536 \| 1536x1024 \| auto/);
+    assert.match(result.stderr, /Allowed values/);
   }
 });
 
-test("image subcommand accepts only the four named sizes", () => {
-  for (const size of ["1024x1024", "1536x1024", "1024x1536", "auto"]) {
+test("image subcommand accepts the discrete sizes listed in OpenAI's gpt-image-2 guide", () => {
+  // Standard tier + experimental tier (>2560x1440) + auto.
+  const allowed = [
+    "1024x1024", "1024x1536", "1536x1024",        // standard small
+    "2048x1152", "2048x2048",                      // standard 2K
+    "2160x3840", "3840x2160",                      // experimental 4K
+    "auto"
+  ];
+  for (const size of allowed) {
     const result = run("node", [SCRIPT, "image", "--size", size, "--output", "/tmp/should-not-exist.png", ""], {
       cwd: ROOT
     });
@@ -78,7 +86,7 @@ test("image subcommand rejects non-PNG output paths", () => {
 test("usage banner advertises the image subcommand", () => {
   const result = run("node", [SCRIPT, "help"], { cwd: ROOT });
   assert.equal(result.status, 0);
-  assert.match(result.stdout, /image \[--size <1024x1024\|1024x1536\|1536x1024\|auto>\]/);
+  assert.match(result.stdout, /image \[--size <1024x1024\|1024x1536\|1536x1024\|2048x1152\|2048x2048\|2160x3840\|3840x2160\|auto>\]/);
   assert.match(result.stdout, /\[--effort <none\|minimal\|low\|medium\|high\|xhigh>\]/);
   assert.match(result.stdout, /image-status \[--json\]/);
 });

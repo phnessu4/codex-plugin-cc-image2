@@ -1,6 +1,6 @@
 ---
 description: Queue an image generation job (returns immediately; daemon worker drains the queue serially)
-argument-hint: "[--size <1024x1024|1024x1536|1536x1024|auto>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt text]"
+argument-hint: "[--size <1024x1024|1024x1536|1536x1024|2048x1152|2048x2048|2160x3840|3840x2160|auto>] [--output <path>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>] [--cwd <path>] [--json] [prompt text]"
 allowed-tools: Bash(node:*)
 ---
 
