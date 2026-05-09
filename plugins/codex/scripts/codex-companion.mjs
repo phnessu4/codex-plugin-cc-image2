@@ -925,7 +925,7 @@ function isValidImageSize(size) {
   return NAMED_IMAGE_SIZES.has(size);
 }
 
-function buildImageTurnPrompt({ promptText, size, outputPath, hasRefs = false }) {
+function buildImageTurnPrompt({ promptText, size, outputPath, hasRefs = false, transparent = false }) {
   const sanitized = String(promptText).replace(/\s+/g, " ").trim();
   const lines = [
     "Use your built-in image_generation tool (gpt-image-2) to generate exactly one image.",
@@ -935,6 +935,12 @@ function buildImageTurnPrompt({ promptText, size, outputPath, hasRefs = false })
     "After generation, reply with only the absolute file path on a single line — no other text.",
     ""
   ];
+  if (transparent) {
+    lines.push(
+      "When invoking the image_generation tool, you MUST set the parameter `background` to the literal string `transparent` so the output PNG carries an alpha channel (RGBA). Do not paint a checkerboard pattern or any solid background — the tool's `background=transparent` parameter must do the work, not the prompt content. The saved PNG must report mode RGBA when opened with PIL.",
+      ""
+    );
+  }
   if (hasRefs) {
     lines.push(
       "The attached image(s) are reference inputs. Use them as character/scene/prop anchors — preserve facial structure, costume detail, set staging, and prop appearance from the references. The text prompt below describes the new shot composition; the references provide visual identity.",
@@ -1086,7 +1092,7 @@ async function acquireImageGenLock({
 
 const VALID_REF_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
 
-function resolveImageGenRequest({ promptText, size, outputArg, cwd, model, effort, refs }) {
+function resolveImageGenRequest({ promptText, size, outputArg, cwd, model, effort, refs, transparent }) {
   if (!promptText || !String(promptText).trim()) {
     throw new Error("Provide a prompt, a --prompt-file, or piped stdin describing the image.");
   }
@@ -1118,7 +1124,8 @@ function resolveImageGenRequest({ promptText, size, outputArg, cwd, model, effor
     outputPath,
     model: normalizeRequestedModel(model),
     effort: normalizeReasoningEffort(effort),
-    refs: resolvedRefs
+    refs: resolvedRefs,
+    transparent: Boolean(transparent)
   };
 }
 
@@ -1165,7 +1172,8 @@ async function executeImageGen(request, { onLockWait } = {}) {
           promptText: request.promptText,
           size: request.size,
           outputPath: request.outputPath,
-          hasRefs: (request.refs ?? []).length > 0
+          hasRefs: (request.refs ?? []).length > 0,
+          transparent: Boolean(request.transparent)
         }),
         defaultPrompt: "",
         model: request.model,
@@ -1455,7 +1463,7 @@ function ensureImageWorkerRunning() {
 async function handleImageEnqueue(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "size", "output", "prompt-file", "cwd"],
-    booleanOptions: ["json"],
+    booleanOptions: ["json", "transparent"],
     aliasMap: {
       m: "model",
       s: "size",
@@ -1471,7 +1479,8 @@ async function handleImageEnqueue(argv) {
     outputArg: options.output,
     cwd,
     model: options.model,
-    effort: options.effort
+    effort: options.effort,
+    transparent: options.transparent
   });
 
   const jobId = generateImageJobId();
@@ -1486,7 +1495,8 @@ async function handleImageEnqueue(argv) {
       size: request.size,
       outputPath: request.outputPath,
       model: request.model,
-      effort: request.effort
+      effort: request.effort,
+      transparent: request.transparent
     },
     promptPreview: previewPrompt(request.promptText)
   };
