@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# img-wait <job-id> [interval-seconds]
+#
+# Block until a codex image-enqueue job finishes. Prints exactly one line:
+#   "ok <output-path>"     on success (exit 0)
+#   "failed <class>"       on failure (exit 1)
+#
+# Designed to be wrapped by an LLM agent's run_in_background so completion
+# arrives as a single notification (≤2 token output) instead of polling.
+#
+# Reads ~/.codex/image-jobs/<job-id>.json directly; no codex CLI subprocess.
+
+set -e
+JOB="${1:?usage: img-wait <job-id> [interval]}"
+INT="${2:-5}"
+F="$HOME/.codex/image-jobs/${JOB}.json"
+[ -f "$F" ] || { echo "missing $F" >&2; exit 2; }
+while :; do
+  S=$(python3 -c "import json;print(json.load(open('$F')).get('status',''))")
+  case "$S" in
+    ok|done|completed|success)
+      python3 -c "import json;d=json.load(open('$F'));print('ok',d.get('request',{}).get('outputPath') or d.get('result',{}).get('outputPath',''))"
+      exit 0;;
+    failed|error)
+      python3 -c "import json;d=json.load(open('$F'));r=d.get('result',{});print('failed',r.get('failureClass') or r.get('class') or 'unknown')"
+      exit 1;;
+    queued|pending|processing|running|"") sleep "$INT";;
+    *) echo "unknown $S" >&2; exit 3;;
+  esac
+done

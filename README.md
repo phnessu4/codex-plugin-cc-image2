@@ -65,11 +65,46 @@ Useful flags shared by `image` and `image-enqueue`:
 - `--cwd` — run the underlying Codex thread in this working directory
 - `--json` — machine-readable output
 
+## Sprite pipeline (Beta)
+
+Three additional commands ship for **white-background → transparent PNG** workflows
+(book layout sprites, asset cutouts). Marked **Beta** because alpha is reconstructed
+locally from RGB output — codex CLI cannot return RGBA (tracked upstream as
+[codex#18944](https://github.com/openai/codex/issues/18944)).
+
+| Command | Purpose |
+|---|---|
+| `/codex:sprite-pipeline` | One-shot: enqueue → wait → rembg → alpha post-process |
+| `/codex:sprite-fix` | Standalone alpha reconstruction (rembg / color-to-alpha / hybrid / chroma / fill-holes) |
+| `/codex:img-wait` | Block-wait one job, print one line (token-efficient for agents) |
+
+**Quality ceiling** (measured on 5-element gold/snow decorative sprite):
+
+| Method | Soft-edge fidelity |
+|---|---|
+| ChatGPT web-UI direct RGBA (ground truth) | 100% |
+| Sprite pipeline (`hybrid`) | ~70% |
+| Sprite pipeline (`rembg`, default) | ~55% |
+
+For critical sprites (titles, drop-caps), keep the `.raw.png` and have ChatGPT
+web-UI strip the background — it returns true RGBA. For bulk sprites (dividers,
+page numbers), the local pipeline is good-enough automation.
+
+**Extra dependencies** (Python; install once):
+
+```bash
+pip install rembg onnxruntime scipy pillow numpy
+```
+
+First `/codex:sprite-pipeline` run downloads the rembg `isnet-general-use` model
+weight (~180MB) into `~/.u2net/`.
+
 ## Requirements
 
 - **ChatGPT subscription (incl. Free) or OpenAI API key.**
   - Usage will contribute to your Codex usage limits. [Learn more](https://developers.openai.com/codex/pricing).
 - **Node.js 18.18 or later**
+- **(Beta sprite pipeline only)** Python 3.10+ with `rembg onnxruntime scipy pillow numpy`
 
 ## Install
 
