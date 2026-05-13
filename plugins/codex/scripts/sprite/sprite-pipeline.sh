@@ -53,7 +53,8 @@ done
 [ -n "$PROMPT_FILE" ] || { echo "missing --prompt-file" >&2; exit 1; }
 [ -n "$OUTPUT" ] || { echo "missing --output" >&2; exit 1; }
 [ -f "$PROMPT_FILE" ] || { echo "prompt file not found: $PROMPT_FILE" >&2; exit 1; }
-command -v rembg >/dev/null 2>&1 || { echo "rembg not installed; pip install rembg onnxruntime scipy" >&2; exit 1; }
+command -v rembg >/dev/null 2>&1 || { echo "rembg not found — run /codex:sprite-setup to install deps" >&2; exit 1; }
+python3 -c "import onnxruntime, scipy, PIL, numpy" 2>/dev/null || { echo "missing Python deps (onnxruntime/scipy/pillow/numpy) — run /codex:sprite-setup" >&2; exit 1; }
 
 RAW="${OUTPUT%.png}.raw.png"
 
